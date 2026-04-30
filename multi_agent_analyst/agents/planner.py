@@ -4,77 +4,93 @@ Implements the Data Planner agent logic.
 
 from __future__ import annotations
 
-from core.state import AgentState
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+import json
+import os
+from typing import Any
+
+from multi_agent_analyst.core.state import AgentState
+
+try:
+    from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+except ImportError:  # pragma: no cover
+    BaseMessage = Any  # type: ignore[misc, assignment]
+
+    class HumanMessage:  # type: ignore[no-redef]
+        def __init__(self, content: str):
+            self.content = content
+
+    class AIMessage:  # type: ignore[no-redef]
+        def __init__(self, content: str):
+            self.content = content
+
+    class SystemMessage:  # type: ignore[no-redef]
+        def __init__(self, content: str):
+            self.content = content
+
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore[assignment]
 
 
 def _extract_user_requirement(messages: list[BaseMessage]) -> str:
-    """
-    Extract the latest human request from the conversation history.
-    """
-
     for message in reversed(messages):
         if isinstance(message, HumanMessage):
             return str(message.content)
-
     if messages:
         return str(messages[-1].content)
-
     return ""
 
 
-def run_planner(state: AgentState) -> dict:
-    """
-    Run the Data Planner agent and update the global state with an analysis plan.
+def _fallback_plan(user_requirement: str, data_profile: dict[str, Any]) -> str:
+    columns = ", ".join(column["name"] for column in data_profile.get("columns", []))
+    return f"""
+Objective: {user_requirement}
 
-    The planner receives the user's analysis request from state["messages"],
-    asks the LLM to produce a rigorous data analysis plan, and returns only the
-    state fields that should be updated by LangGraph.
+Data profile:
+- Rows: {data_profile.get("shape", {}).get("rows", 0)}
+- Columns: {columns}
+
+Executable analysis plan:
+1. Load the CSV from DATA_SOURCE and validate that the file can be parsed.
+2. Standardize column names, inspect missing values, and keep cleaning decisions explicit.
+3. Produce descriptive statistics for numeric fields and frequency summaries for categorical fields.
+4. Generate publication-style visualizations for informative numeric and categorical fields.
+5. Write all findings into analysis_results.json with summary, insights, and chart metadata.
+6. Save chart files into OUTPUT_DIR so the report renderer can include them.
+""".strip()
+
+
+def run_planner(state: AgentState) -> dict[str, Any]:
+    """
+    Build an implementation-oriented analysis plan.
     """
 
     messages = state.get("messages", [])
-    user_requirement = _extract_user_requirement(messages)
+    user_requirement = state.get("user_request") or _extract_user_requirement(messages)
+    data_profile = state.get("data_profile", {})
+
+    if ChatOpenAI is None or not os.getenv("OPENAI_API_KEY"):
+        llm_output = _fallback_plan(user_requirement, data_profile)
+        return {"plan": llm_output, "messages": [AIMessage(content=llm_output)]}
 
     system_prompt = """
 You are the Data Planner agent in a LangGraph-based multi-agent data analysis system.
-
-Your role is to act as a senior data scientist and mathematician. You must transform
-the user's data analysis request and any provided schema information into a rigorous,
-step-by-step analysis plan for the downstream Coder agent.
-
-Planning requirements:
-1. Clarify the analytical objective, target variables, feature variables, and expected outputs.
-2. Design a statistically rigorous workflow, including data validation, missing-value handling,
-   outlier detection, distribution checks, and assumptions that must be verified before modeling.
-3. Explicitly specify appropriate statistical methods or machine learning models when relevant,
-   such as descriptive statistics, normality tests, correlation analysis, hypothesis testing,
-   regression models, PCA, multidimensional subspace analysis, clustering, K-Means,
-   classification models, or time-series methods.
-4. Explain why each method is mathematically or statistically suitable for the task.
-5. Give concrete instructions for the Coder agent about how to implement data cleaning,
-   feature engineering, transformations, encoding, scaling, train/test splitting,
-   model evaluation, and result reporting.
-6. Do not invent fields that are not present in the user's request or schema. If information is
-   missing, state the uncertainty and provide a conservative executable plan.
-7. Output a clear, implementation-oriented plan. Do not write executable Python code.
+Transform the user's request and data profile into a rigorous, executable analysis plan.
+Do not invent fields. Include data validation, cleaning, statistical methods, charts,
+and exact deliverables expected from the Coder agent. Do not write executable code.
 """.strip()
 
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0,
-    )
-
-    response = llm.invoke(
+    response = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0).invoke(
         [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=user_requirement),
+            HumanMessage(
+                content=(
+                    f"User request:\n{user_requirement}\n\n"
+                    f"Data profile JSON:\n{json.dumps(data_profile, ensure_ascii=False, indent=2)}"
+                )
+            ),
         ]
     )
-
     llm_output = str(response.content)
-
-    return {
-        "plan": llm_output,
-        "messages": [AIMessage(content=llm_output)],
-    }
+    return {"plan": llm_output, "messages": [AIMessage(content=llm_output)]}

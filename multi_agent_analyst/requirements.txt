@@ -8,3 +8,8 @@ python-dotenv
 pandas
 numpy
 scikit-learn
+matplotlib
+seaborn
+jinja2
+sqlalchemy
+pytest

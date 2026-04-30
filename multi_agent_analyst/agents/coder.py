@@ -4,52 +4,64 @@ Implements the Coder agent logic.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from multi_agent_analyst.core.state import AgentState
 
-from core.state import AgentState
+try:
+    from langchain_core.messages import HumanMessage, SystemMessage
+except ImportError:  # pragma: no cover
+    class HumanMessage:  # type: ignore[no-redef]
+        def __init__(self, content: str):
+            self.content = content
+
+    class SystemMessage:  # type: ignore[no-redef]
+        def __init__(self, content: str):
+            self.content = content
+
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:  # pragma: no cover
+    ChatOpenAI = None  # type: ignore[assignment]
 
 
 SYSTEM_PROMPT = """
-你是一位资深 Python 数据工程师，负责根据 Data Planner 提供的数据分析计划编写可执行的 Python 数据分析代码。
-
-你必须严格遵守以下要求：
-
-1. 只输出 Python 代码，并且必须把代码包裹在 ```python 和 ``` 之间。
-2. 不要输出任何解释、寒暄、Markdown 标题或代码之外的文字。
-3. 代码应当结构清晰、健壮，包含必要的异常处理。
-4. 数据清洗逻辑必须严格依据 Data Planner 的计划实现。
-5. 如果存在上一次执行错误，必须根据错误栈修复代码，不要重复同样的问题。
-6. 如需使用 matplotlib、seaborn 或其他可视化库，必须使用莫兰迪高级色系（Morandi palette）。
-7. 可视化图表的整体排版必须符合顶级学术期刊的精简风格：低饱和配色、简洁坐标轴、清晰标题、适度留白、避免多余装饰。
-8. 不要假设不存在的字段；所有字段使用必须来自 Data Planner 的分析计划或用户上下文。
-"""
+You are a senior Python data engineer. Generate executable data analysis code.
+Rules:
+1. Output only Python code wrapped in ```python and ```.
+2. Read the CSV from environment variable DATA_SOURCE.
+3. Write all artifacts into environment variable OUTPUT_DIR.
+4. Always create analysis_results.json with summary, insights, cleaning_notes, and charts.
+5. Save report-ready charts with a clean low-saturation style.
+6. If previous execution failed, repair the code based on the error.
+7. Do not invent columns outside the provided data profile.
+""".strip()
 
 
 def _build_user_prompt(state: AgentState) -> str:
-    """
-    Build the prompt payload sent to the Coder LLM.
-    """
-
     plan = state.get("plan", "")
-    execution_result = state.get("execution_result", "")
+    execution_result = state.get("execution_result", {})
+    data_profile = state.get("data_profile", {})
 
     prompt_parts = [
-        "请根据以下 Data Planner 生成的分析计划，编写完整、可执行的 Python 数据分析代码。",
+        "Build complete executable Python analysis code from this plan and data profile.",
         "",
-        "Data Planner 分析计划：",
+        "Plan:",
         str(plan),
+        "",
+        "Data profile JSON:",
+        json.dumps(data_profile, ensure_ascii=False, indent=2),
     ]
 
-    if execution_result:
+    if execution_result and execution_result.get("status") != "success":
         prompt_parts.extend(
             [
                 "",
-                "这是上次执行的错误栈，请修复代码：",
-                str(execution_result),
+                "Previous execution failed. Fix the code using this result:",
+                json.dumps(execution_result, ensure_ascii=False, indent=2),
             ]
         )
 
@@ -69,26 +81,15 @@ def _extract_python_code(llm_output: str) -> str:
         llm_output,
         flags=re.IGNORECASE | re.DOTALL,
     )
-
     if match:
         return match.group(1).strip()
-
-    # Defensive fallback:
-    # The system prompt strongly requires fenced Python code, but this keeps the
-    # workflow usable if the model returns plain code without fences.
     return llm_output.strip()
 
 
 def _get_response_text(response: Any) -> str:
-    """
-    Normalize LangChain model responses into plain text.
-    """
-
     content = getattr(response, "content", response)
-
     if isinstance(content, str):
         return content
-
     if isinstance(content, list):
         text_parts: list[str] = []
         for item in content:
@@ -97,30 +98,121 @@ def _get_response_text(response: Any) -> str:
             elif isinstance(item, dict) and item.get("type") == "text":
                 text_parts.append(str(item.get("text", "")))
         return "\n".join(part for part in text_parts if part)
-
     return str(content)
 
 
-def run_coder(state: AgentState) -> dict:
+def _fallback_code() -> str:
+    """
+    Deterministic script used when no LLM credentials are configured.
+    """
+
+    return r'''
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+
+
+DATA_SOURCE = Path(os.environ["DATA_SOURCE"])
+OUTPUT_DIR = Path(os.environ["OUTPUT_DIR"])
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+sns.set_theme(style="whitegrid", palette=["#7A8F87", "#C3A995", "#8EA4B8", "#B48E92", "#A7A37E"])
+
+df = pd.read_csv(DATA_SOURCE)
+original_shape = df.shape
+df.columns = [str(col).strip().replace(" ", "_") for col in df.columns]
+
+missing_summary = df.isna().sum().sort_values(ascending=False)
+numeric_columns = df.select_dtypes(include="number").columns.tolist()
+categorical_columns = [col for col in df.columns if col not in numeric_columns]
+charts = []
+
+if numeric_columns:
+    plt.figure(figsize=(9, 5))
+    corr = df[numeric_columns].corr(numeric_only=True)
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap="vlag", center=0, linewidths=0.5)
+    plt.title("Numeric Correlation Heatmap")
+    plt.tight_layout()
+    chart_path = OUTPUT_DIR / "numeric_correlation_heatmap.png"
+    plt.savefig(chart_path, dpi=160)
+    plt.close()
+    charts.append({"title": "Numeric Correlation Heatmap", "path": str(chart_path)})
+
+    first_numeric = numeric_columns[0]
+    plt.figure(figsize=(8, 5))
+    sns.histplot(df[first_numeric].dropna(), kde=True, color="#7A8F87")
+    plt.title(f"Distribution of {first_numeric}")
+    plt.xlabel(first_numeric)
+    plt.ylabel("Count")
+    plt.tight_layout()
+    chart_path = OUTPUT_DIR / f"distribution_{first_numeric}.png"
+    plt.savefig(chart_path, dpi=160)
+    plt.close()
+    charts.append({"title": f"Distribution of {first_numeric}", "path": str(chart_path)})
+
+if categorical_columns:
+    first_category = categorical_columns[0]
+    counts = df[first_category].astype(str).value_counts().head(10)
+    plt.figure(figsize=(9, 5))
+    sns.barplot(x=counts.values, y=counts.index, color="#8EA4B8")
+    plt.title(f"Top Categories of {first_category}")
+    plt.xlabel("Count")
+    plt.ylabel(first_category)
+    plt.tight_layout()
+    chart_path = OUTPUT_DIR / f"top_categories_{first_category}.png"
+    plt.savefig(chart_path, dpi=160)
+    plt.close()
+    charts.append({"title": f"Top Categories of {first_category}", "path": str(chart_path)})
+
+insights = [
+    f"Loaded {original_shape[0]} rows and {original_shape[1]} columns from {DATA_SOURCE.name}.",
+    f"Detected {len(numeric_columns)} numeric columns and {len(categorical_columns)} non-numeric columns.",
+]
+if int(missing_summary.sum()) > 0:
+    top_missing = missing_summary[missing_summary > 0].head(3)
+    insights.append("Top missing fields: " + ", ".join(f"{col}={int(val)}" for col, val in top_missing.items()))
+else:
+    insights.append("No missing values were detected in the loaded CSV.")
+
+results = {
+    "summary": "The workflow profiled the dataset, generated descriptive statistics, and rendered report-ready charts.",
+    "insights": insights,
+    "cleaning_notes": [
+        "Column names were stripped and spaces were replaced with underscores for code safety.",
+        "Rows were not dropped automatically; missingness is reported for review."
+    ],
+    "numeric_summary": df[numeric_columns].describe().round(4).to_dict() if numeric_columns else {},
+    "charts": charts,
+}
+
+(OUTPUT_DIR / "analysis_results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+print(json.dumps({"status": "ok", "charts": len(charts)}, ensure_ascii=False))
+'''.strip()
+
+
+def run_coder(state: AgentState) -> dict[str, Any]:
     """
     Generate or repair Python analysis code based on the current AgentState.
     """
 
+    if ChatOpenAI is None or not os.getenv("OPENAI_API_KEY"):
+        return {"generated_code": _fallback_code()}
+
     try:
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT.strip()),
-            HumanMessage(content=_build_user_prompt(state)),
-        ]
-
-        response = llm.invoke(messages)
-        raw_output = _get_response_text(response)
-        clean_code = _extract_python_code(raw_output)
-
-        return {"generated_code": clean_code}
-
+        response = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0).invoke(
+            [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=_build_user_prompt(state)),
+            ]
+        )
+        return {"generated_code": _extract_python_code(_get_response_text(response))}
     except Exception as exc:
-        # In production, replace this with structured logging and error tracing.
-        # Re-raising keeps LangGraph from silently continuing with invalid code.
         raise RuntimeError(f"Coder agent failed to generate Python code: {exc}") from exc
